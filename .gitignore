@@ -1,0 +1,5 @@
+.env
+*.age
+chave*.txt
+*-key.txt
+.DS_Store

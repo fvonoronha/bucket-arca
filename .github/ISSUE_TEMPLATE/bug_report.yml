@@ -1,0 +1,47 @@
+name: 🐞 Bug
+description: Algo não funciona como deveria
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "⚠️ **Não cole senhas, chaves ou o `.env` inteiro.** Falha de segurança? Use o relato privado (aba Security)."
+  - type: textarea
+    id: what
+    attributes:
+      label: O que aconteceu
+      description: E o que você esperava que acontecesse.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Como reproduzir
+      placeholder: "1. ...\n2. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      render: text
+  - type: input
+    id: image
+    attributes:
+      label: Imagem e versão
+      placeholder: "ghcr.io/fvonoronha/bucket-arca:v1.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: SOURCE_PROVIDER
+      options: [r2, aws, s3, local, rclone]
+    validations:
+      required: true
+  - type: dropdown
+    id: storage
+    attributes:
+      label: STORAGE_PROVIDER
+      options: [aws, r2, s3, local, rclone]
+    validations:
+      required: true

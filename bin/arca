@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+# bucket-arca - backup de um bucket (Cloudflare R2, AWS S3, compatíveis com S3, disco local ou
+# qualquer serviço do rclone) para outro armazenamento. Uso: arca <comando> [opções]. Ver `arca help`.
+
+# Pasta real do script, mesmo quando chamado por um link (ex.: /usr/local/bin/arca).
+ARCA_SELF="${BASH_SOURCE[0]}"
+while [ -L "$ARCA_SELF" ]; do
+    ARCA_LINK="$(readlink "$ARCA_SELF")"
+    case "$ARCA_LINK" in /*) ARCA_SELF="$ARCA_LINK" ;; *) ARCA_SELF="$(dirname "$ARCA_SELF")/$ARCA_LINK" ;; esac
+done
+ARCA_HOME="$(cd "$(dirname "$ARCA_SELF")" && pwd)"
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$ARCA_HOME/lib.sh" || { echo "arca: não encontrei $ARCA_HOME/lib.sh" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+bucket-arca - backup de um bucket para outro armazenamento
+
+Comandos:
+  backup                  Roda agora os trabalhos ligados (espelho e/ou snapshot).
+  mirror [--force]        Espelho: copia só o que mudou para <destino>/atual. Com
+                          MIRROR_HISTORY=true, o que foi alterado/apagado na origem vai antes
+                          para <destino>/historico/<data>/. --force ignora as travas de
+                          segurança (origem vazia, limite de remoções).
+  snapshot                Snapshot: o bucket inteiro num único .tar(.zst)(.age) em
+                          <destino>/snapshots/.
+  list [atual|historico|historico/<data>|snapshots]
+                          Lista o que está guardado (sem argumento: um resumo).
+  versions <caminho>      Todas as cópias de um arquivo (atual e cada data do histórico).
+  restore <fonte> --to <destino> [--path <caminho>] [--yes]
+                          Restaura. <fonte>: atual | historico/<data> | snapshot (o mais novo) |
+                          snapshot/<arquivo>. <destino>: origem (o próprio bucket de origem;
+                          exige --yes) ou uma pasta (/restore). --path limita a um arquivo ou
+                          pasta. Nunca apaga nada no destino.
+  verify [mirror|snapshot]
+                          mirror: compara a origem com <destino>/atual (tamanho e hash).
+                          snapshot: baixa o mais novo e confere se abre (e decifra).
+  prune                   Apaga snapshots e datas do histórico mais velhos que
+                          SNAPSHOT_RETENTION_DAYS / HISTORY_RETENTION_DAYS.
+  check                   Confere a configuração e o acesso à origem e ao destino.
+  cron                    Agenda os trabalhos e fica rodando (padrão do container).
+  help                    Esta ajuda.
+EOF
+}
+
+# Filtros do rclone para um --path (arquivo ou pasta, relativo à raiz do bucket).
+path_filters() {
+    local path="${1#/}"
+    path="${path%/}"
+    case "/$path/" in */../* | */./*) die "caminho inválido: $1" ;; esac
+    printf '%s\n' "--include" "/$path" "--include" "/$path/**"
+}
+
+# ------------------------------------------------------------------ espelho
+
+cmd_mirror() {
+    local force=false
+    [ "${1:-}" = "--force" ] && force=true
+    setup_storage
+    new_work_dir
+    acquire_lock mirror
+    local ts started current history src dst src_count src_bytes dst_count log_file
+    ts="$(timestamp)"
+    started="$(date +%s)"
+    current="$DST/atual"
+    history="$DST/historico/$ts"
+    log_file="$WORK_DIR/mirror.log"
+    log "Espelho $ts: $SRC -> $current${MIRROR_STORAGE_CLASS:+ (classe $MIRROR_STORAGE_CLASS)}"
+    is_true "$MIRROR_HISTORY" && log "  alterados/apagados na origem vão para $history"
+
+    # Travas: uma origem que "some" (credencial errada, bucket trocado) não pode esvaziar a cópia.
+    if ! src="$(size_of "$SRC")"; then
+        notify mirror down "bucket-arca: não consegui listar a origem"
+        die "não consegui listar a origem $SRC"
+    fi
+    dst="$(count_objects "$current")"
+    src_count="${src% *}"
+    src_bytes="${src#* }"
+    dst_count="${dst% *}"
+    if ! $force && [ "$src_count" -eq 0 ] && [ "$dst_count" -gt 0 ]; then
+        notify mirror down "bucket-arca: origem vazia, espelho recusado"
+        die "a origem está VAZIA e a cópia tem $dst_count objeto(s): recusado. Se foi de propósito, rode 'arca mirror --force'."
+    fi
+
+    local args=(sync "$SRC" "$current" --log-file "$log_file" --log-level INFO)
+    case "$MIRROR_COMPARE" in
+        checksum) args+=(--checksum) ;;
+        size) args+=(--size-only) ;;
+        modtime) ;;
+        *) die "MIRROR_COMPARE inválido: $MIRROR_COMPARE (checksum, modtime ou size)" ;;
+    esac
+    is_true "$MIRROR_HISTORY" && args+=(--backup-dir "$history")
+    if ! $force && [ "$MIRROR_MAX_DELETE_PERCENT" -gt 0 ] 2> /dev/null && [ "$dst_count" -gt 0 ]; then
+        local max=$(((dst_count * MIRROR_MAX_DELETE_PERCENT + 99) / 100))
+        [ "$max" -ge 10 ] || max=10
+        args+=(--max-delete "$max")
+    fi
+
+    if ! rc_class "$MIRROR_STORAGE_CLASS" "${args[@]}"; then
+        tail -n 20 "$log_file" >&2 || true
+        if grep -q "max-delete" "$log_file" 2> /dev/null; then
+            warn "mais remoções do que MIRROR_MAX_DELETE_PERCENT=$MIRROR_MAX_DELETE_PERCENT% permite; confira a origem. Se estiver certo, rode 'arca mirror --force'."
+        fi
+        notify mirror down "bucket-arca: espelho falhou"
+        die "espelho falhou"
+    fi
+
+    # Resumo: + novo, ~ alterado, - removido. Com histórico, o rclone registra a troca de um
+    # arquivo como "tira o antigo" + "copia o novo": alterado = foi para o histórico E foi copiado.
+    local copied="$WORK_DIR/copiados" archived="$WORK_DIR/arquivados" changes="$WORK_DIR/mudancas"
+    grep -E ': Copied \((new|replaced existing)\)' "$log_file" | sed 's/^.*INFO  *: //; s/: Copied (.*$//' | sort -u > "$copied" || true
+    if is_true "$MIRROR_HISTORY"; then
+        rc lsf -R --files-only "$history" 2> /dev/null | sort -u > "$archived" || true
+        {
+            comm -13 "$archived" "$copied" | sed 's/^/+ /'
+            comm -12 "$archived" "$copied" | sed 's/^/~ /'
+            comm -23 "$archived" "$copied" | sed 's/^/- /'
+        } > "$changes"
+    else
+        {
+            grep ': Copied (new)' "$log_file" | sed 's/^.*INFO  *: //; s/: Copied (.*$//; s/^/+ /'
+            grep ': Copied (replaced' "$log_file" | sed 's/^.*INFO  *: //; s/: Copied (.*$//; s/^/~ /'
+            grep ': Deleted' "$log_file" | sed 's/^.*INFO  *: //; s/: Deleted.*$//; s/^/- /'
+        } > "$changes" || true
+    fi
+    local new changed removed
+    new="$(grep -c '^+ ' "$changes" || true)"
+    changed="$(grep -c '^~ ' "$changes" || true)"
+    removed="$(grep -c '^- ' "$changes" || true)"
+    head -n 100 "$changes" | sed 's/^/  /'
+    [ "$(wc -l < "$changes")" -le 100 ] || log "  (lista cortada em 100 linhas)"
+
+    if [ "${HISTORY_RETENTION_DAYS:-0}" -gt 0 ] 2> /dev/null; then
+        (prune_history) || warn "falha ao apagar datas antigas do histórico"
+    fi
+
+    local elapsed=$(($(date +%s) - started)) summary
+    summary="$src_count objeto(s), $(human_size "$src_bytes"); $new novo(s), $changed alterado(s), $removed removido(s) em ${elapsed}s"
+    log "Espelho concluído: $summary"
+    notify mirror up "bucket-arca espelho: $summary"
+}
+
+# ------------------------------------------------------------------ snapshot
+
+cmd_snapshot() {
+    setup_storage
+    new_work_dir
+    acquire_lock snapshot
+    local ts started ext name file src src_count src_bytes free
+    ts="$(timestamp)"
+    started="$(date +%s)"
+    ext="$(compression_ext)"
+    name="${BACKUP_NAME}_${ts}.tar${ext}"
+    encryption_enabled && name="$name.age"
+    encryption_enabled || warn "snapshot SEM criptografia (defina BACKUP_ENCRYPTION_RECIPIENTS)"
+    log "Snapshot $ts: $SRC -> $DST/snapshots/$name${SNAPSHOT_STORAGE_CLASS:+ (classe $SNAPSHOT_STORAGE_CLASS)}"
+
+    if ! src="$(size_of "$SRC")"; then
+        notify snapshot down "bucket-arca: não consegui listar a origem"
+        die "não consegui listar a origem $SRC"
+    fi
+    src_count="${src% *}"
+    src_bytes="${src#* }"
+    [ "$src_count" -gt 0 ] || warn "a origem está vazia: o snapshot sai vazio"
+    # Os arquivos baixados + o pacote gerado, com folga de 64 MB.
+    free="$(free_bytes)"
+    if [ "$free" -lt $((src_bytes * 2 + 67108864)) ]; then
+        notify snapshot down "bucket-arca: sem espaço para o snapshot"
+        die "sem espaço em ${TMPDIR:-/tmp}: livre $(human_size "$free"), preciso de ~$(human_size $((src_bytes * 2))). Use um volume maior em TMPDIR."
+    fi
+
+    mkdir -p "$WORK_DIR/dados"
+    if ! rc copy "$SRC" "$WORK_DIR/dados"; then
+        notify snapshot down "bucket-arca: falha ao baixar a origem"
+        die "falha ao baixar a origem"
+    fi
+    local got
+    got="$(find "$WORK_DIR/dados" -type f | wc -l | tr -d ' ')"
+    [ "$got" -eq "$src_count" ] || warn "baixei $got arquivo(s), a origem listou $src_count (mudou durante o snapshot?)"
+
+    file="$WORK_DIR/$name"
+    if encryption_enabled; then
+        tar -C "$WORK_DIR/dados" -cf - . | compress_stream | encrypt_stream > "$file"
+    else
+        tar -C "$WORK_DIR/dados" -cf - . | compress_stream > "$file"
+    fi || { notify snapshot down "bucket-arca: falha ao empacotar"; die "falha ao empacotar"; }
+    rm -rf "$WORK_DIR/dados"
+
+    local size
+    size="$(wc -c < "$file" | tr -d ' ')"
+    # --no-check-dest: não pergunta antes se já existe (o nome tem data e hora). Numa credencial
+    # mínima, a AWS responde 403 em vez de 404 para essa pergunta e o envio falharia.
+    if ! rc_class "$SNAPSHOT_STORAGE_CLASS" copyto --no-check-dest "$file" "$DST/snapshots/$name"; then
+        notify snapshot down "bucket-arca: falha ao enviar o snapshot"
+        die "falha ao enviar o snapshot"
+    fi
+    rm -f "$file"
+
+    if [ "${SNAPSHOT_RETENTION_DAYS:-0}" -gt 0 ] 2> /dev/null; then
+        (prune_snapshots) || warn "falha ao apagar snapshots antigos"
+    fi
+
+    local elapsed=$(($(date +%s) - started)) summary
+    summary="$got arquivo(s), $(human_size "$src_bytes") -> $(human_size "$size") em ${elapsed}s"
+    log "Snapshot concluído: $summary ($name)"
+    notify snapshot up "bucket-arca snapshot: $summary"
+}
+
+# ------------------------------------------------------------------ backup (os dois)
+
+cmd_backup() {
+    local failures=0 ran=0
+    if schedule_enabled "$MIRROR_SCHEDULE"; then
+        ran=$((ran + 1))
+        "$0" mirror || failures=$((failures + 1))
+    fi
+    if schedule_enabled "$SNAPSHOT_SCHEDULE"; then
+        ran=$((ran + 1))
+        "$0" snapshot || failures=$((failures + 1))
+    fi
+    [ "$ran" -gt 0 ] || die "nenhum trabalho ligado (MIRROR_SCHEDULE e SNAPSHOT_SCHEDULE desligados)"
+    [ "$failures" -eq 0 ] || die "$failures de $ran trabalho(s) falharam"
+}
+
+# ------------------------------------------------------------------ list / versions
+
+latest_snapshot() {
+    local name
+    name="$(rc lsf --files-only "$DST/snapshots" 2> /dev/null | grep "^${BACKUP_NAME}_.*\.tar" | sort | tail -n 1 || true)"
+    [ -n "$name" ] || die "nenhum snapshot em $DST/snapshots"
+    printf '%s' "$name"
+}
+
+cmd_list() {
+    setup_storage
+    local what="${1:-}"
+    case "$what" in
+        "")
+            local cur
+            cur="$(count_objects "$DST/atual")"
+            log "Cópias em $DST"
+            printf 'atual:      %s objeto(s), %s\n' "${cur% *}" "$(human_size "${cur#* }")"
+            printf 'historico:  (data: arquivos arquivados)\n'
+            rc lsf -R --files-only "$DST/historico" 2> /dev/null | awk -F/ '{ n[$1]++ } END { for (d in n) printf "  %s  %d\n", d, n[d] }' | sort || true
+            printf 'snapshots:\n'
+            rc lsl "$DST/snapshots" 2> /dev/null | awk '{ printf "  %10s  %s %s  %s\n", $1, $2, substr($3, 1, 8), $4 }' | sort -k4 || true
+            ;;
+        atual | snapshots)
+            rc lsl "$DST/$what" 2> /dev/null | awk '{ printf "%10s  %s %s  %s\n", $1, $2, substr($3, 1, 8), $4 }' | sort -k4 || true
+            ;;
+        historico)
+            rc lsf --dirs-only "$DST/historico" 2> /dev/null | tr -d '/' | sort || true
+            ;;
+        historico/*)
+            require_name "${what#historico/}"
+            rc lsl "$DST/$what" 2> /dev/null | awk '{ printf "%10s  %s %s  %s\n", $1, $2, substr($3, 1, 8), $4 }' | sort -k4 || true
+            ;;
+        *) die "uso: arca list [atual|historico|historico/<data>|snapshots]" ;;
+    esac
+}
+
+cmd_versions() {
+    [ -n "${1:-}" ] || die "uso: arca versions <caminho/do/arquivo>"
+    local path="${1#/}"
+    case "/$path/" in */../* | */./*) die "caminho inválido: $1" ;; esac
+    setup_storage
+    log "Cópias de '$path' (atual e cada data do histórico; os snapshots também o contêm)"
+    local out
+    out="$(rc lsl "$DST" --include "/atual/$path" --include "/historico/*/$path" 2> /dev/null |
+        awk '{ printf "%10s  %s %s  %s\n", $1, $2, substr($3, 1, 8), $4 }' | sort -k4 || true)"
+    [ -n "$out" ] || die "nenhuma cópia de '$path' no espelho nem no histórico"
+    printf '%s\n' "$out"
+}
+
+# ------------------------------------------------------------------ restore
+
+# Baixa, decifra e extrai um snapshot em $2.
+extract_snapshot() {
+    local name="$1" into="$2" file
+    file="$WORK_DIR/$name"
+    log "Baixando snapshots/$name" >&2
+    rc copyto "$DST/snapshots/$name" "$file" >&2 ||
+        die "não consegui baixar snapshots/$name (se a classe for GLACIER/DEEP_ARCHIVE, ele precisa ser descongelado antes na AWS)"
+    mkdir -p "$into"
+    case "$file" in
+        *.age)
+            local identity
+            identity="$(identity_file)"
+            age --decrypt -i "$identity" "$file" | decompress_stream "${file%.age}" | tar -C "$into" -xf - ||
+                die "não consegui abrir snapshots/$name (chave privada errada?)"
+            ;;
+        *) decompress_stream "${file##*/}" < "$file" | tar -C "$into" -xf - || die "não consegui abrir snapshots/$name" ;;
+    esac
+    rm -f "$file"
+}
+
+cmd_restore() {
+    local source="" target="" path="" yes=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --to) target="${2:-}"; shift 2 ;;
+            --path) path="${2:-}"; shift 2 ;;
+            --yes | -y) yes=true; shift ;;
+            -*) die "opção desconhecida: $1" ;;
+            *) source="$1"; shift ;;
+        esac
+    done
+    [ -n "$source" ] && [ -n "$target" ] ||
+        die "uso: arca restore <atual|historico/<data>|snapshot|snapshot/<arquivo>> --to <origem|/pasta> [--path <caminho>] [--yes]"
+
+    setup_storage
+    new_work_dir
+    local dest
+    case "$target" in
+        origem)
+            $yes || die "restaurar NA ORIGEM ($SRC) sobrescreve arquivos de mesmo nome lá. Repita com --yes (ou restaure numa pasta primeiro)"
+            dest="$SRC"
+            ;;
+        /*) dest="$target" ;;
+        *) die "--to precisa ser 'origem' ou uma pasta absoluta (ex.: /restore)" ;;
+    esac
+
+    local filters=()
+    if [ -n "$path" ]; then
+        mapfile -t filters < <(path_filters "$path")
+    fi
+
+    local from
+    case "$source" in
+        atual) from="$DST/atual" ;;
+        historico/*)
+            require_name "${source#historico/}"
+            from="$DST/$source"
+            ;;
+        snapshot | snapshot/*)
+            local name="${source#snapshot}"
+            name="${name#/}"
+            if [ -z "$name" ]; then name="$(latest_snapshot)"; else require_name "$name"; fi
+            extract_snapshot "$name" "$WORK_DIR/extraido"
+            from="$WORK_DIR/extraido"
+            ;;
+        *) die "fonte inválida: $source (atual, historico/<data>, snapshot ou snapshot/<arquivo>)" ;;
+    esac
+
+    log "Restaurando $source${path:+ ($path)} -> $dest"
+    # copy (nunca sync): nada é apagado no destino.
+    rc copy "$from" "$dest" "${filters[@]}" --log-file "$WORK_DIR/restore.log" --log-level INFO ||
+        { tail -n 20 "$WORK_DIR/restore.log" >&2; die "restauração falhou"; }
+    local copied
+    copied="$(grep -c 'Copied' "$WORK_DIR/restore.log" || true)"
+    [ "$copied" -gt 0 ] || warn "nada copiado (nada encontrado${path:+ em \"$path\"}, ou o destino já estava igual)"
+    log "Restaurado: $copied arquivo(s) copiado(s) para $dest"
+}
+
+# ------------------------------------------------------------------ verify
+
+verify_mirror() {
+    local args=(check "$SRC" "$DST/atual" --one-way)
+    [ "$MIRROR_COMPARE" = "size" ] && args+=(--size-only)
+    log "Comparando $SRC com $DST/atual"
+    if rc "${args[@]}" 2> "$WORK_DIR/check.log"; then
+        log "espelho: OK (tudo o que está na origem está na cópia, igual)"
+    else
+        grep -E 'ERROR|differences|not in' "$WORK_DIR/check.log" | tail -n 30 >&2 || true
+        warn "espelho: há diferenças (normal para arquivos enviados à origem depois do último espelho)"
+        return 1
+    fi
+}
+
+verify_snapshot() {
+    local name count
+    name="$(latest_snapshot)"
+    extract_snapshot "$name" "$WORK_DIR/verificacao"
+    count="$(find "$WORK_DIR/verificacao" -type f | wc -l | tr -d ' ')"
+    log "snapshot: OK ($name abre, $count arquivo(s), $(human_size "$(du -sk "$WORK_DIR/verificacao" | awk '{ print $1 * 1024 }')"))"
+    rm -rf "$WORK_DIR/verificacao"
+}
+
+cmd_verify() {
+    setup_storage
+    new_work_dir
+    local what="${1:-}" failures=0
+    case "$what" in
+        mirror) verify_mirror || failures=1 ;;
+        snapshot) (verify_snapshot) || failures=1 ;;
+        "")
+            schedule_enabled "$MIRROR_SCHEDULE" && { verify_mirror || failures=$((failures + 1)); }
+            schedule_enabled "$SNAPSHOT_SCHEDULE" && { (verify_snapshot) || failures=$((failures + 1)); }
+            ;;
+        *) die "uso: arca verify [mirror|snapshot]" ;;
+    esac
+    [ "$failures" -eq 0 ] || die "verificação com problema"
+    log "Verificação concluída"
+}
+
+# ------------------------------------------------------------------ prune
+
+# Data/hora UTC de N dias atrás, no formato dos nomes (20260929T030000Z): comparável como texto.
+cutoff() { date -u -d "@$(($(date +%s) - $1 * 86400))" +%Y%m%dT%H%M%SZ; }
+
+prune_snapshots() {
+    local days="${SNAPSHOT_RETENTION_DAYS:-0}" keep="${SNAPSHOT_KEEP_MIN:-3}" min_days limit all protected name ts
+    [ "$days" -gt 0 ] 2> /dev/null || { log "SNAPSHOT_RETENTION_DAYS não definido: nenhum snapshot a apagar"; return 0; }
+    min_days="$(min_days_for_class "$SNAPSHOT_STORAGE_CLASS")"
+    [ "$days" -ge "$min_days" ] || warn "a classe $SNAPSHOT_STORAGE_CLASS cobra no mínimo $min_days dias: apagar com $days dias não economiza"
+    limit="$(cutoff "$days")"
+    log "Apagando snapshots de antes de $limit (mantendo os $keep mais novos)"
+    all="$(rc lsf --files-only "$DST/snapshots" 2> /dev/null | grep "^${BACKUP_NAME}_" | sort || true)"
+    # Os `keep` mais novos nunca saem, mesmo que velhos (ex.: o snapshot parou de rodar).
+    protected="$(printf '%s\n' "$all" | sed '/^$/d' | tail -n "$keep")"
+    for name in $all; do
+        ts="${name#"${BACKUP_NAME}"_}"
+        ts="${ts%%.*}"
+        [[ "$ts" < "$limit" ]] || continue
+        printf '%s\n' "$protected" | grep -qxF "$name" && continue
+        rc deletefile "$DST/snapshots/$name"
+        log "  apagado: snapshots/$name"
+    done
+}
+
+prune_history() {
+    local days="${HISTORY_RETENTION_DAYS:-0}" limit dir
+    [ "$days" -gt 0 ] 2> /dev/null || { log "HISTORY_RETENTION_DAYS não definido: nada a apagar do histórico"; return 0; }
+    limit="$(cutoff "$days")"
+    log "Apagando datas do histórico de antes de $limit"
+    for dir in $(rc lsf --dirs-only "$DST/historico" 2> /dev/null | tr -d '/'); do
+        [[ "$dir" < "$limit" ]] || continue
+        rc purge "$DST/historico/$dir"
+        log "  apagado: historico/$dir"
+    done
+}
+
+cmd_prune() {
+    setup_storage
+    new_work_dir
+    prune_snapshots
+    prune_history
+}
+
+# ------------------------------------------------------------------ check
+
+# Traduz os erros mais comuns do S3 numa dica do que conferir. $2 = SOURCE ou STORAGE.
+storage_hint() {
+    local err="$1" p="$2"
+    if grep -q "SignatureDoesNotMatch" "$err"; then
+        warn "A chave SECRETA (${p}_SECRET_ACCESS_KEY) não confere com a access key. Confira se foi copiada inteira, sem espaço/aspas, e se é do mesmo par de ${p}_ACCESS_KEY_ID. Compare a 'impressão' da linha 'Credencial' com a da sua chave: printf %s 'CHAVE' | sha256sum | cut -c1-8"
+    elif grep -q "InvalidAccessKeyId" "$err"; then
+        warn "${p}_ACCESS_KEY_ID não existe (ou foi desativada) nesta conta."
+    elif grep -q "AccessDenied" "$err"; then
+        warn "Acesso negado: confira as permissões da credencial de ${p} (bucket e prefixo)."
+    elif grep -qE "PermanentRedirect|AuthorizationHeaderMalformed|IllegalLocationConstraint" "$err"; then
+        warn "Região errada: ${p}_REGION precisa ser a região do bucket."
+    elif grep -q "NoSuchBucket" "$err"; then
+        warn "O bucket $(opt "$p" BUCKET) não existe (ou está em outra conta)."
+    elif grep -q "InvalidStorageClass" "$err"; then
+        warn "Este destino não aceita a classe de armazenamento configurada (MIRROR_/SNAPSHOT_STORAGE_CLASS)."
+    fi
+}
+
+cmd_check() {
+    setup_storage
+    new_work_dir
+    local src enabled=0
+    log "bucket-arca $ARCA_VERSION ($(rclone version | head -n 1))"
+
+    log "Origem: $SOURCE_PROVIDER -> $SRC"
+    [ -z "${SOURCE_KEY_INFO:-}" ] || log "  credencial: $SOURCE_KEY_INFO"
+    if ! src="$(size_of "$SRC" 2> "$WORK_DIR/src.err")"; then
+        cat "$WORK_DIR/src.err" >&2
+        storage_hint "$WORK_DIR/src.err" SOURCE
+        die "não consegui LER a origem"
+    fi
+    log "  $(printf '%s' "$src" | cut -d' ' -f1) objeto(s), $(human_size "${src#* }")"
+
+    log "Destino: $STORAGE_PROVIDER -> $DST"
+    [ -z "${STORAGE_KEY_INFO:-}" ] || log "  credencial: $STORAGE_KEY_INFO"
+    local probe="$WORK_DIR/.arca-check"
+    date > "$probe"
+    if ! rc copyto --no-check-dest "$probe" "$DST/.arca-check" 2> "$WORK_DIR/dst.err"; then
+        cat "$WORK_DIR/dst.err" >&2
+        storage_hint "$WORK_DIR/dst.err" STORAGE
+        die "não consegui GRAVAR no destino"
+    fi
+    rc cat "$DST/.arca-check" > /dev/null || die "não consegui LER do destino"
+    rc deletefile "$DST/.arca-check" 2> /dev/null ||
+        warn "não consegui apagar o arquivo de teste $DST/.arca-check (esperado com a política recomendada, que só permite apagar em atual/; a regra de ciclo de vida limpa)"
+
+    if encryption_enabled; then
+        printf 'teste' | encrypt_stream > /dev/null || die "BACKUP_ENCRYPTION_RECIPIENTS inválido"
+        log "Criptografia do snapshot: ligada (age)"
+    else
+        warn "Criptografia do snapshot: DESLIGADA"
+    fi
+
+    if schedule_enabled "$MIRROR_SCHEDULE"; then
+        enabled=$((enabled + 1))
+        log "Espelho: '$MIRROR_SCHEDULE'; histórico: $(is_true "$MIRROR_HISTORY" && echo "sim (${HISTORY_RETENTION_DAYS:-0} dias; 0 = regra do bucket)" || echo não); compara por: $MIRROR_COMPARE; classe: ${MIRROR_STORAGE_CLASS:-padrão do bucket}"
+    else
+        log "Espelho: desligado"
+    fi
+    if schedule_enabled "$SNAPSHOT_SCHEDULE"; then
+        enabled=$((enabled + 1))
+        compression_ext > /dev/null
+        log "Snapshot: '$SNAPSHOT_SCHEDULE'; compressão: $SNAPSHOT_COMPRESSION; classe: ${SNAPSHOT_STORAGE_CLASS:-padrão do bucket}; retenção: ${SNAPSHOT_RETENTION_DAYS:-0} dias (0 = regra do bucket)"
+        case "$SNAPSHOT_STORAGE_CLASS" in
+            GLACIER | DEEP_ARCHIVE) warn "snapshots em $SNAPSHOT_STORAGE_CLASS precisam ser descongelados na AWS (horas) antes de restore/verify" ;;
+        esac
+        local free
+        free="$(free_bytes)"
+        [ "$free" -ge $((${src#* } * 2)) ] ||
+            warn "espaço livre em ${TMPDIR:-/tmp} ($(human_size "$free")) menor que o dobro da origem: o snapshot vai falhar"
+    else
+        log "Snapshot: desligado"
+    fi
+    [ "$enabled" -gt 0 ] || die "nenhum trabalho ligado: defina MIRROR_SCHEDULE e/ou SNAPSHOT_SCHEDULE"
+    log "Fuso: TZ=${TZ:-UTC}"
+    log "Tudo certo."
+}
+
+# ------------------------------------------------------------------ cron (container)
+
+cmd_cron() {
+    # Confere tudo antes de agendar: configuração errada aparece na subida, não às 3h.
+    "$0" check
+    # O crond não repassa o ambiente do container para o job: salvo só o que o arca usa, num
+    # arquivo legível apenas pelo root.
+    local env_file=/run/arca.env
+    (umask 077 && export -p | grep -E '^(declare -x|export) (SOURCE_|STORAGE_|MIRROR_|SNAPSHOT_|HISTORY_|BACKUP_|RCLONE_|AGE_|AWS_|HEALTHCHECK_URL|TZ|TMPDIR|ARCA_)' > "$env_file")
+    mkdir -p /etc/crontabs
+    : > /etc/crontabs/root
+    # O crond roda o job com sh (ash); o arquivo de ambiente usa a sintaxe do bash.
+    if schedule_enabled "$MIRROR_SCHEDULE"; then
+        printf "%s bash -c '. %s; exec %s mirror' > /proc/1/fd/1 2>&1\n" "$MIRROR_SCHEDULE" "$env_file" "$ARCA_HOME/arca" >> /etc/crontabs/root
+        log "Espelho agendado: '$MIRROR_SCHEDULE' (TZ=${TZ:-UTC})"
+    fi
+    if schedule_enabled "$SNAPSHOT_SCHEDULE"; then
+        printf "%s bash -c '. %s; exec %s snapshot' > /proc/1/fd/1 2>&1\n" "$SNAPSHOT_SCHEDULE" "$env_file" "$ARCA_HOME/arca" >> /etc/crontabs/root
+        log "Snapshot agendado: '$SNAPSHOT_SCHEDULE' (TZ=${TZ:-UTC})"
+    fi
+    if is_true "${BACKUP_ON_STARTUP:-false}"; then
+        "$0" backup || true
+    fi
+    exec crond -f -l 8
+}
+
+# ------------------------------------------------------------------ main
+
+command="${1:-help}"
+[ $# -gt 0 ] && shift
+case "$command" in
+    backup) cmd_backup ;;
+    mirror) cmd_mirror "$@" ;;
+    snapshot) cmd_snapshot ;;
+    list | ls) cmd_list "$@" ;;
+    versions) cmd_versions "$@" ;;
+    restore) cmd_restore "$@" ;;
+    verify) cmd_verify "$@" ;;
+    prune) cmd_prune ;;
+    check) cmd_check ;;
+    cron) cmd_cron ;;
+    help | -h | --help) usage ;;
+    version | --version) echo "bucket-arca $ARCA_VERSION" ;;
+    *) usage; exit 1 ;;
+esac

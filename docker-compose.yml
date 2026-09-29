@@ -1,0 +1,12 @@
+# Exemplo com docker compose (espelho todo dia às 3h + snapshot aos domingos às 4h).
+#   docker compose up -d                          (sobe no modo agendado)
+#   docker compose run --rm arca backup           (espelho + snapshot agora)
+#   docker compose run --rm arca list             (resumo do que está guardado)
+#   docker compose run --rm -v ./restore:/restore arca restore atual --to /restore
+# Para o Docker Swarm (Portainer), ver o exemplo de stack no README.
+services:
+  arca:
+    image: ghcr.io/fvonoronha/bucket-arca:v1.0.0
+    # build: .
+    env_file: .env
+    restart: unless-stopped
