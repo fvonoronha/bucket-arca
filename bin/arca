@@ -305,8 +305,9 @@ cmd_restore() {
             *) source="$1"; shift ;;
         esac
     done
-    [ -n "$source" ] && [ -n "$target" ] ||
+    if [ -z "$source" ] || [ -z "$target" ]; then
         die "uso: arca restore <atual|historico/<data>|snapshot|snapshot/<arquivo>> --to <origem|/pasta> [--path <caminho>] [--yes]"
+    fi
 
     setup_storage
     new_work_dir
