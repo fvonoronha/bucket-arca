@@ -117,7 +117,12 @@ s3 lsf m:destino/backups/teste/snapshots | grep -q '^teste_.*\.tar\.zst\.age$' |
 ok "snapshot (.tar.zst.age)"
 
 arca verify snapshot > "$WORK/out" 2>&1 && fail "verify sem a chave privada deveria falhar"
-ok "sem a chave privada não abre"
+if ! grep -q "defina AGE_IDENTITY" "$WORK/out" || grep -qE "Baixando|tar:|age:" "$WORK/out"; then
+    cat "$WORK/out"; fail "sem a chave, deveria parar antes de baixar, só com a mensagem da chave"
+fi
+docker run --rm --network "$NET" "${base_env[@]}" "${storage_env[@]}" -e AGE_IDENTITY="$(grep -v '^#' "$WORK/chave.txt" | sed 's/AGE-SECRET-KEY-1./AGE-SECRET-KEY-1Q/')" "$IMAGE" verify snapshot > "$WORK/out" 2>&1 &&
+    fail "verify com a chave errada deveria falhar"
+ok "sem a chave privada (ou com a errada) não abre, com mensagem clara"
 run arca_key verify snapshot
 grep -q "3 arquivo" "$WORK/out" || { cat "$WORK/out"; fail "verify snapshot"; }
 ok "verify snapshot"

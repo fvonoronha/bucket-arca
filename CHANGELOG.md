@@ -2,6 +2,11 @@
 
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/); versões seguem [SemVer](https://semver.org/lang/pt-BR/).
 
+## [Não lançado]
+
+### Corrigido
+- `verify snapshot` / `restore snapshot` sem a chave privada: agora param antes de baixar, só com a mensagem "defina AGE_IDENTITY...". Antes, seguiam adiante e mostravam erros do `age`, `zstd` e `tar` e a dica enganosa "chave privada errada?".
+
 ## [1.0.0] - 2026-09-29
 
 Primeira versão.
