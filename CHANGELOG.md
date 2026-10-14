@@ -4,6 +4,9 @@ Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/); 
 
 ## [1.0.1] - 2026-10-14
 
+### Alterado
+- Imagem base Alpine 3.24 (era 3.22): rclone 1.74, age 1.3, curl 8.22 e bash 5.3. Os snapshots cifrados com a versão anterior continuam abrindo.
+
 ### Corrigido
 - `verify snapshot` / `restore snapshot` sem a chave privada: agora param antes de baixar, só com a mensagem "defina AGE_IDENTITY...". Antes, seguiam adiante e mostravam erros do `age`, `zstd` e `tar` e a dica enganosa "chave privada errada?".
 
