@@ -6,7 +6,7 @@
 # Para o Docker Swarm (Portainer), ver o exemplo de stack no README.
 services:
   arca:
-    image: ghcr.io/fvonoronha/bucket-arca:v1.0.0
+    image: ghcr.io/fvonoronha/bucket-arca:v1.0.1
     # build: .
     env_file: .env
     restart: unless-stopped

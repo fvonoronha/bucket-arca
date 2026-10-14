@@ -276,21 +276,21 @@ cmd_versions() {
 
 # Baixa, decifra e extrai um snapshot em $2.
 extract_snapshot() {
-    local name="$1" into="$2" file
+    local name="$1" into="$2" file identity=""
     file="$WORK_DIR/$name"
+    # A chave antes de baixar: sem ela, para aqui com a mensagem certa. O "|| exit" explícito é
+    # porque, chamada dentro de "( ) || ..." (verify), o errexit do bash fica desligado.
+    case "$name" in *.age) identity="$(identity_file)" || exit 1 ;; esac
     log "Baixando snapshots/$name" >&2
     rc copyto "$DST/snapshots/$name" "$file" >&2 ||
         die "não consegui baixar snapshots/$name (se a classe for GLACIER/DEEP_ARCHIVE, ele precisa ser descongelado antes na AWS)"
     mkdir -p "$into"
-    case "$file" in
-        *.age)
-            local identity
-            identity="$(identity_file)"
-            age --decrypt -i "$identity" "$file" | decompress_stream "${file%.age}" | tar -C "$into" -xf - ||
-                die "não consegui abrir snapshots/$name (chave privada errada?)"
-            ;;
-        *) decompress_stream "${file##*/}" < "$file" | tar -C "$into" -xf - || die "não consegui abrir snapshots/$name" ;;
-    esac
+    if [ -n "$identity" ]; then
+        age --decrypt -i "$identity" "$file" | decompress_stream "${file%.age}" | tar -C "$into" -xf - ||
+            die "não consegui abrir snapshots/$name (chave privada errada?)"
+    else
+        decompress_stream "${file##*/}" < "$file" | tar -C "$into" -xf - || die "não consegui abrir snapshots/$name"
+    fi
     rm -f "$file"
 }
 
